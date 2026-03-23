@@ -343,13 +343,26 @@ pub fn create_index(
         .to_device(device);
 
     let n_options = 2_i32.pow(nbits as u32);
-    let quantiles_base =
-        Tensor::arange_start(0, n_options.into(), (Kind::Float, device)) * (1.0 / n_options as f64);
-    let cutoff_quantiles = quantiles_base.narrow(0, 1, n_options as i64 - 1);
-    let weight_quantiles = &quantiles_base + (0.5 / n_options as f64);
 
-    let bucket_cutoffs = heldout_res_raw.quantile(&cutoff_quantiles, None, false, "linear");
-    let bucket_weights = heldout_res_raw.quantile(&weight_quantiles, None, false, "linear");
+    // Use scalar_quantile_kthvalue instead of Tensor::quantile to avoid
+    // PyTorch's "input tensor is too large" error on large datasets.
+    let heldout_flat = heldout_res_raw.flatten(0, -1);
+
+    let mut cutoff_vals: Vec<Tensor> = Vec::new();
+    for i in 1..n_options as i64 {
+        let q = i as f64 / n_options as f64;
+        cutoff_vals.push(scalar_quantile_kthvalue(&heldout_flat, q));
+    }
+    let bucket_cutoffs = Tensor::cat(&cutoff_vals, 0);
+
+    let mut weight_vals: Vec<Tensor> = Vec::new();
+    for i in 0..n_options as i64 {
+        let q = (i as f64 + 0.5) / n_options as f64;
+        weight_vals.push(scalar_quantile_kthvalue(&heldout_flat, q));
+    }
+    let bucket_weights = Tensor::cat(&weight_vals, 0);
+
+    drop(heldout_flat);
 
     drop(heldout_res_raw);
 
