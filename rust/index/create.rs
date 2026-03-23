@@ -353,14 +353,14 @@ pub fn create_index(
         let q = i as f64 / n_options as f64;
         cutoff_vals.push(scalar_quantile_kthvalue(&heldout_flat, q));
     }
-    let bucket_cutoffs = Tensor::stack(&cutoff_vals, 0);
+    let bucket_cutoffs = Tensor::cat(&cutoff_vals, 0);
 
     let mut weight_vals: Vec<Tensor> = Vec::new();
     for i in 0..n_options as i64 {
         let q = (i as f64 + 0.5) / n_options as f64;
         weight_vals.push(scalar_quantile_kthvalue(&heldout_flat, q));
     }
-    let bucket_weights = Tensor::stack(&weight_vals, 0);
+    let bucket_weights = Tensor::cat(&weight_vals, 0);
 
     drop(heldout_flat);
 
