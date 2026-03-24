@@ -984,8 +984,9 @@ class FastPlaid:
         """Search the index and return token-level similarity matrices.
 
         Same as search() but each result tuple includes a third element: a tensor
-        of shape (query_tokens, doc_tokens) containing the cosine similarity
-        between each query token and each document token.
+        of shape (query_tokens, doc_tokens) containing the dot-product similarity
+        between each query token and each document token (equivalent to cosine
+        similarity when embeddings are L2-normalized).
 
         Args:
         ----

@@ -156,7 +156,8 @@ impl QueryResultWithTokenScores {
     /// Returns the per-document token similarity matrices.
     ///
     /// Each tensor has shape `[query_tokens, doc_tokens]` where values are
-    /// the cosine similarity between each query token and each document token.
+    /// the dot-product similarity between each query token and each document token
+    /// (equivalent to cosine similarity when embeddings are L2-normalized).
     #[getter]
     fn token_scores(&self) -> Vec<PyTensor> {
         self.token_scores_inner
