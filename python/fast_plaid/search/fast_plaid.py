@@ -735,6 +735,140 @@ class FastPlaid:
             except OSError as e:
                 raise e
 
+    def _prepare_search(
+        self,
+        queries_embeddings: torch.Tensor | list[torch.Tensor],
+        subset: list[list[int]] | list[int] | None,
+    ) -> tuple[dict[str, Any], torch.Tensor, list[list[int]] | None]:
+        """Shared setup for search methods: reload index, validate, normalize inputs.
+
+        Returns:
+        -------
+        A tuple of (search_indices, queries_tensor, normalized_subset).
+
+        """
+        self._check_and_reload_index(blocking=False)
+
+        with self._index_swap_lock:
+            search_indices = dict(self.indices)
+
+        if any(idx is None for idx in search_indices.values()):
+            self._check_and_reload_index(blocking=True)
+            with self._index_swap_lock:
+                search_indices = dict(self.indices)
+
+        if not os.path.exists(os.path.join(self.index, "metadata.json")):
+            error = f"""
+            Index metadata not found in '{self.index}'.
+            Please create the index before searching.
+            """
+            raise FileNotFoundError(error)
+
+        for device in self.devices:
+            if search_indices[device] is None:
+                error = f"""Index could not be loaded on device '{device}'.
+                Check CUDA memory or device availability."""
+                raise RuntimeError(error)
+
+        if isinstance(queries_embeddings, list):
+            queries_embeddings = torch.nn.utils.rnn.pad_sequence(
+                sequences=[
+                    embedding[0] if embedding.dim() == 3 else embedding
+                    for embedding in queries_embeddings
+                ],
+                batch_first=True,
+                padding_value=0.0,
+            )
+
+        num_queries = queries_embeddings.shape[0]
+
+        if subset is not None:
+            if isinstance(subset, int):
+                subset = [subset] * num_queries
+            if isinstance(subset, list) and len(subset) == 0:
+                subset = None
+            if isinstance(subset, list) and isinstance(subset[0], int):
+                subset = [subset] * num_queries  # type: ignore
+
+            if subset is not None and len(subset) != num_queries:
+                raise ValueError("Subset length must match number of queries.")
+
+        return search_indices, queries_embeddings, subset  # type: ignore
+
+    def _dispatch_search(
+        self,
+        device_fn: Any,
+        search_indices: dict[str, Any],
+        queries_embeddings: torch.Tensor,
+        subset: list[list[int]] | None,
+        *,
+        batch_size: int,
+        n_full_scores: int,
+        top_k: int,
+        n_ivf_probe: int,
+        show_progress: bool,
+    ) -> list:
+        """Dispatch search to single or multiple GPUs via ThreadPoolExecutor.
+
+        Args:
+        ----
+        device_fn:
+            The per-device search callable (search_on_device or
+            search_on_device_with_token_scores).
+
+        """
+        num_queries = queries_embeddings.shape[0]
+
+        if len(self.devices) == 1:
+            return device_fn(
+                device=self.devices[0],
+                queries_embeddings=queries_embeddings,
+                batch_size=batch_size,
+                n_full_scores=n_full_scores,
+                top_k=top_k,
+                n_ivf_probe=n_ivf_probe,
+                index_object=search_indices[self.devices[0]],
+                show_progress=show_progress,
+                subset=subset,
+            )
+
+        # Multi-GPU split
+        num_devices = len(self.devices)
+        chunk_size = math.ceil(num_queries / num_devices)
+        query_chunks = list(torch.split(queries_embeddings, chunk_size))
+        subset_chunks: list = []
+        if subset is not None:
+            for i in range(0, num_queries, chunk_size):
+                subset_chunks.append(subset[i : i + chunk_size])
+        else:
+            subset_chunks = [None] * len(query_chunks)  # type: ignore
+
+        futures = []
+        with ThreadPoolExecutor(max_workers=num_devices) as executor:
+            for i, device in enumerate(self.devices):
+                if i >= len(query_chunks):
+                    break
+                futures.append(
+                    executor.submit(
+                        device_fn,
+                        device=device,
+                        queries_embeddings=query_chunks[i],
+                        batch_size=batch_size,
+                        n_full_scores=n_full_scores,
+                        top_k=top_k,
+                        n_ivf_probe=n_ivf_probe,
+                        index_object=search_indices[device],
+                        show_progress=show_progress and (i == 0),
+                        subset=subset_chunks[i],
+                    )
+                )
+
+        all_results = []
+        for future in futures:
+            all_results.extend(future.result())
+
+        return all_results
+
     @torch.inference_mode()
     def search(  # noqa: PLR0912
         self,
@@ -773,56 +907,13 @@ class FastPlaid:
             Ignored if running on GPU(s). Defaults to 1.
 
         """
-        # Non-blocking reload: if an update is in progress, continue with current index
-        self._check_and_reload_index(blocking=False)
-
-        # Get a snapshot of current indices (atomic read)
-        with self._index_swap_lock:
-            search_indices = dict(self.indices)
-
-        if any(idx is None for idx in search_indices.values()):
-            # Try blocking reload if we have no valid index
-            self._check_and_reload_index(blocking=True)
-            with self._index_swap_lock:
-                search_indices = dict(self.indices)
-
-        if not os.path.exists(os.path.join(self.index, "metadata.json")):
-            error = f"""
-            Index metadata not found in '{self.index}'.
-            Please create the index before searching.
-            """
-            raise FileNotFoundError(error)
-
-        for device in self.devices:
-            if search_indices[device] is None:
-                error = f"""Index could not be loaded on device '{device}'.
-                Check CUDA memory or device availability."""
-                raise RuntimeError(error)
-
-        if isinstance(queries_embeddings, list):
-            queries_embeddings = torch.nn.utils.rnn.pad_sequence(
-                sequences=[
-                    embedding[0] if embedding.dim() == 3 else embedding
-                    for embedding in queries_embeddings
-                ],
-                batch_first=True,
-                padding_value=0.0,
-            )
+        search_indices, queries_embeddings, subset = self._prepare_search(
+            queries_embeddings, subset
+        )
 
         num_queries = queries_embeddings.shape[0]
 
-        # Standardize subset
-        if subset is not None:
-            if isinstance(subset, int):
-                subset = [subset] * num_queries
-            if isinstance(subset, list) and len(subset) == 0:
-                subset = None
-            if isinstance(subset, list) and isinstance(subset[0], int):
-                subset = [subset] * num_queries  # type: ignore
-
-            if subset is not None and len(subset) != num_queries:
-                raise ValueError("Subset length must match number of queries.")
-
+        # Joblib parallelism for CPU-only bulk search
         is_cpu_only = self.devices[0] == "cpu"
         use_joblib = (is_cpu_only and (num_queries > 10) and n_processes != 1) or (
             is_cpu_only
@@ -861,55 +952,17 @@ class FastPlaid:
             )
             return [item for sublist in results for item in sublist]
 
-        if len(self.devices) == 1:
-            return search_on_device(
-                device=self.devices[0],
-                queries_embeddings=queries_embeddings,
-                batch_size=batch_size,
-                n_full_scores=n_full_scores,
-                top_k=top_k,
-                n_ivf_probe=n_ivf_probe,
-                index_object=search_indices[self.devices[0]],
-                show_progress=show_progress,
-                subset=subset,  # type: ignore
-            )
-
-        # Multi-GPU Split
-        num_devices = len(self.devices)
-        chunk_size = math.ceil(num_queries / num_devices)
-        futures = []
-        query_chunks = list(torch.split(queries_embeddings, chunk_size))
-        subset_chunks = []
-        if subset is not None:
-            for i in range(0, num_queries, chunk_size):
-                subset_chunks.append(subset[i : i + chunk_size])
-        else:
-            subset_chunks = [None] * len(query_chunks)  # type: ignore
-
-        with ThreadPoolExecutor(max_workers=num_devices) as executor:
-            for i, device in enumerate(self.devices):
-                if i >= len(query_chunks):
-                    break
-                futures.append(
-                    executor.submit(
-                        search_on_device,
-                        device=device,
-                        queries_embeddings=query_chunks[i],
-                        batch_size=batch_size,
-                        n_full_scores=n_full_scores,
-                        top_k=top_k,
-                        n_ivf_probe=n_ivf_probe,
-                        index_object=search_indices[device],
-                        show_progress=show_progress and (i == 0),
-                        subset=subset_chunks[i],  # type: ignore
-                    )
-                )
-
-        all_results = []
-        for future in futures:
-            all_results.extend(future.result())
-
-        return all_results
+        return self._dispatch_search(
+            search_on_device,
+            search_indices,
+            queries_embeddings,
+            subset,  # type: ignore
+            batch_size=batch_size,
+            n_full_scores=n_full_scores,
+            top_k=top_k,
+            n_ivf_probe=n_ivf_probe,
+            show_progress=show_progress,
+        )
 
     @torch.inference_mode()
     def search_token_scores(
@@ -949,101 +1002,21 @@ class FastPlaid:
             the entire index.
 
         """
-        self._check_and_reload_index(blocking=False)
+        search_indices, queries_embeddings, subset = self._prepare_search(
+            queries_embeddings, subset
+        )
 
-        with self._index_swap_lock:
-            search_indices = dict(self.indices)
-
-        if any(idx is None for idx in search_indices.values()):
-            self._check_and_reload_index(blocking=True)
-            with self._index_swap_lock:
-                search_indices = dict(self.indices)
-
-        if not os.path.exists(os.path.join(self.index, "metadata.json")):
-            error = f"""
-            Index metadata not found in '{self.index}'.
-            Please create the index before searching.
-            """
-            raise FileNotFoundError(error)
-
-        for device in self.devices:
-            if search_indices[device] is None:
-                error = f"""Index could not be loaded on device '{device}'.
-                Check CUDA memory or device availability."""
-                raise RuntimeError(error)
-
-        if isinstance(queries_embeddings, list):
-            queries_embeddings = torch.nn.utils.rnn.pad_sequence(
-                sequences=[
-                    embedding[0] if embedding.dim() == 3 else embedding
-                    for embedding in queries_embeddings
-                ],
-                batch_first=True,
-                padding_value=0.0,
-            )
-
-        num_queries = queries_embeddings.shape[0]
-
-        if subset is not None:
-            if isinstance(subset, int):
-                subset = [subset] * num_queries
-            if isinstance(subset, list) and len(subset) == 0:
-                subset = None
-            if isinstance(subset, list) and isinstance(subset[0], int):
-                subset = [subset] * num_queries  # type: ignore
-
-            if subset is not None and len(subset) != num_queries:
-                raise ValueError("Subset length must match number of queries.")
-
-        if len(self.devices) == 1:
-            return search_on_device_with_token_scores(
-                device=self.devices[0],
-                queries_embeddings=queries_embeddings,
-                batch_size=batch_size,
-                n_full_scores=n_full_scores,
-                top_k=top_k,
-                n_ivf_probe=n_ivf_probe,
-                index_object=search_indices[self.devices[0]],
-                show_progress=show_progress,
-                subset=subset,  # type: ignore
-            )
-
-        # Multi-GPU split
-        num_devices = len(self.devices)
-        chunk_size = math.ceil(num_queries / num_devices)
-        futures = []
-        query_chunks = list(torch.split(queries_embeddings, chunk_size))
-        subset_chunks = []
-        if subset is not None:
-            for i in range(0, num_queries, chunk_size):
-                subset_chunks.append(subset[i : i + chunk_size])
-        else:
-            subset_chunks = [None] * len(query_chunks)  # type: ignore
-
-        with ThreadPoolExecutor(max_workers=num_devices) as executor:
-            for i, device in enumerate(self.devices):
-                if i >= len(query_chunks):
-                    break
-                futures.append(
-                    executor.submit(
-                        search_on_device_with_token_scores,
-                        device=device,
-                        queries_embeddings=query_chunks[i],
-                        batch_size=batch_size,
-                        n_full_scores=n_full_scores,
-                        top_k=top_k,
-                        n_ivf_probe=n_ivf_probe,
-                        index_object=search_indices[device],
-                        show_progress=show_progress and (i == 0),
-                        subset=subset_chunks[i],  # type: ignore
-                    )
-                )
-
-        all_results = []
-        for future in futures:
-            all_results.extend(future.result())
-
-        return all_results
+        return self._dispatch_search(
+            search_on_device_with_token_scores,
+            search_indices,
+            queries_embeddings,
+            subset,  # type: ignore
+            batch_size=batch_size,
+            n_full_scores=n_full_scores,
+            top_k=top_k,
+            n_ivf_probe=n_ivf_probe,
+            show_progress=show_progress,
+        )
 
     @torch.inference_mode()
     def delete(
