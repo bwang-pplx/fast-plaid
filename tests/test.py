@@ -172,6 +172,30 @@ class TestSearchTokenScores:
                     f"Score mismatch: search={s1}, token_scores={s2}"
                 )
 
+    def test_search_token_scores_maxsim_values(self, test_index_path):
+        """Test that manual MaxSim over token matrices matches returned scores."""
+        index = search.FastPlaid(index=test_index_path, device="cpu")
+
+        documents_embeddings = [
+            torch.randn(50, 128, device="cpu") for _ in range(30)
+        ]
+        queries_embeddings = torch.randn(3, 20, 128, device="cpu")
+
+        index.create(documents_embeddings=documents_embeddings, kmeans_niters=4)
+        results = index.search_token_scores(
+            queries_embeddings=queries_embeddings, top_k=10
+        )
+
+        for query_results in results:
+            for doc_id, score, token_scores in query_results:
+                # Manual MaxSim: for each query token, max similarity across
+                # doc tokens, then sum. token_scores is [query_tokens, doc_tokens].
+                manual_score = token_scores.max(dim=1).values.sum().item()
+                assert abs(manual_score - score) < 0.1, (
+                    f"Doc {doc_id}: manual MaxSim={manual_score:.4f} != "
+                    f"returned score={score:.4f}"
+                )
+
 
 class TestUpdate:
     """Tests for index update functionality."""
