@@ -807,17 +807,62 @@ class FastPlaid:
         top_k: int,
         n_ivf_probe: int,
         show_progress: bool,
+        n_processes: int | None = None,
     ) -> list:
-        """Dispatch search to single or multiple GPUs via ThreadPoolExecutor.
+        """Dispatch search across devices, including joblib CPU parallelism.
 
         Args:
         ----
         device_fn:
             The per-device search callable (search_on_device or
             search_on_device_with_token_scores).
+        n_processes:
+            Number of jobs for CPU parallelism via joblib.
+            Ignored on GPU. Defaults to 1.
 
         """
         num_queries = queries_embeddings.shape[0]
+
+        # Joblib parallelism for CPU-only bulk search
+        is_cpu_only = self.devices[0] == "cpu"
+        use_joblib = (is_cpu_only and (num_queries > 10) and n_processes != 1) or (
+            is_cpu_only
+            and n_processes is not None
+            and n_processes != 1
+            and num_queries > 1
+        )
+
+        if n_processes is None:
+            n_processes = min(num_queries // 10, os.cpu_count() or 1)
+
+        if use_joblib:
+            num_workers = n_processes
+            chunk_size = math.ceil(num_queries / num_workers)
+            query_chunks = list(torch.split(queries_embeddings, chunk_size))
+            subset_chunks: list = []
+            if subset is not None:
+                for i in range(0, num_queries, chunk_size):
+                    subset_chunks.append(subset[i : i + chunk_size])
+            else:
+                subset_chunks = [None] * len(query_chunks)  # type: ignore
+
+            results = Parallel(n_jobs=num_workers, prefer="threads")(
+                delayed(device_fn)(
+                    device="cpu",
+                    queries_embeddings=chunk,
+                    batch_size=batch_size,
+                    n_full_scores=n_full_scores,
+                    top_k=top_k,
+                    n_ivf_probe=n_ivf_probe,
+                    index_object=search_indices["cpu"],
+                    show_progress=(show_progress and i == 0),
+                    subset=sub_chunk,
+                )
+                for i, (chunk, sub_chunk) in enumerate(
+                    zip(query_chunks, subset_chunks)
+                )
+            )
+            return [item for sublist in results for item in sublist]
 
         if len(self.devices) == 1:
             return device_fn(
@@ -836,12 +881,12 @@ class FastPlaid:
         num_devices = len(self.devices)
         chunk_size = math.ceil(num_queries / num_devices)
         query_chunks = list(torch.split(queries_embeddings, chunk_size))
-        subset_chunks: list = []
+        subset_chunks_gpu: list = []
         if subset is not None:
             for i in range(0, num_queries, chunk_size):
-                subset_chunks.append(subset[i : i + chunk_size])
+                subset_chunks_gpu.append(subset[i : i + chunk_size])
         else:
-            subset_chunks = [None] * len(query_chunks)  # type: ignore
+            subset_chunks_gpu = [None] * len(query_chunks)  # type: ignore
 
         futures = []
         with ThreadPoolExecutor(max_workers=num_devices) as executor:
@@ -859,7 +904,7 @@ class FastPlaid:
                         n_ivf_probe=n_ivf_probe,
                         index_object=search_indices[device],
                         show_progress=show_progress and (i == 0),
-                        subset=subset_chunks[i],
+                        subset=subset_chunks_gpu[i],
                     )
                 )
 
@@ -870,7 +915,7 @@ class FastPlaid:
         return all_results
 
     @torch.inference_mode()
-    def search(  # noqa: PLR0912
+    def search(
         self,
         queries_embeddings: torch.Tensor | list[torch.Tensor],
         top_k: int = 10,
@@ -911,47 +956,6 @@ class FastPlaid:
             queries_embeddings, subset
         )
 
-        num_queries = queries_embeddings.shape[0]
-
-        # Joblib parallelism for CPU-only bulk search
-        is_cpu_only = self.devices[0] == "cpu"
-        use_joblib = (is_cpu_only and (num_queries > 10) and n_processes != 1) or (
-            is_cpu_only
-            and n_processes is not None
-            and n_processes != 1
-            and num_queries > 1
-        )
-
-        if n_processes is None:
-            n_processes = min(num_queries // 10, os.cpu_count() or 1)
-
-        if use_joblib:
-            num_workers = n_processes
-            chunk_size = math.ceil(num_queries / num_workers)
-            query_chunks = list(torch.split(queries_embeddings, chunk_size))
-            subset_chunks = []
-            if subset is not None:
-                for i in range(0, num_queries, chunk_size):
-                    subset_chunks.append(subset[i : i + chunk_size])
-            else:
-                subset_chunks = [None] * len(query_chunks)  # type: ignore
-
-            results = Parallel(n_jobs=num_workers, prefer="threads")(
-                delayed(search_on_device)(
-                    device="cpu",
-                    queries_embeddings=chunk,
-                    batch_size=batch_size,
-                    n_full_scores=n_full_scores,
-                    top_k=top_k,
-                    n_ivf_probe=n_ivf_probe,
-                    index_object=search_indices["cpu"],
-                    show_progress=(show_progress and i == 0),
-                    subset=sub_chunk,
-                )
-                for i, (chunk, sub_chunk) in enumerate(zip(query_chunks, subset_chunks))
-            )
-            return [item for sublist in results for item in sublist]
-
         return self._dispatch_search(
             search_on_device,
             search_indices,
@@ -962,6 +966,7 @@ class FastPlaid:
             top_k=top_k,
             n_ivf_probe=n_ivf_probe,
             show_progress=show_progress,
+            n_processes=n_processes,
         )
 
     @torch.inference_mode()
@@ -974,6 +979,7 @@ class FastPlaid:
         n_ivf_probe: int = 8,
         show_progress: bool = True,
         subset: list[list[int]] | list[int] | None = None,
+        n_processes: int | None = None,
     ) -> list[list[tuple[int, float, torch.Tensor]]]:
         """Search the index and return token-level similarity matrices.
 
@@ -1000,6 +1006,9 @@ class FastPlaid:
             A list of lists specifying subsets of the index to search for each
             query, or a single list applied to all queries. If None, searches
             the entire index.
+        n_processes:
+            Number of jobs to use for CPU search via joblib.
+            Ignored if running on GPU(s). Defaults to 1.
 
         """
         search_indices, queries_embeddings, subset = self._prepare_search(
@@ -1016,6 +1025,7 @@ class FastPlaid:
             top_k=top_k,
             n_ivf_probe=n_ivf_probe,
             show_progress=show_progress,
+            n_processes=n_processes,
         )
 
     @torch.inference_mode()
