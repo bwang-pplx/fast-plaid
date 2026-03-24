@@ -4,6 +4,8 @@ use pyo3::prelude::*;
 use serde::Serialize;
 use tch::{Device, IndexOp, Kind, Tensor};
 
+use pyo3_tch::PyTensor;
+
 use crate::search::load::LoadedIndex;
 use crate::search::padding::direct_pad_sequences;
 use crate::search::tensor::StridedTensor;
@@ -123,6 +125,47 @@ pub struct QueryResult {
     pub scores: Vec<f32>,
 }
 
+/// Represents the results of a single search query with token-level similarity matrices.
+///
+/// Similar to `QueryResult` but also includes per-document token similarity
+/// matrices of shape `[query_tokens, doc_tokens]` for each returned document.
+///
+/// # Safety
+/// `tch::Tensor` is internally reference-counted and thread-safe, but its raw
+/// pointer prevents auto-deriving `Sync`. We assert it here since PyO3 requires
+/// `Sync` for `#[pyclass]` structs.
+#[pyclass]
+#[derive(Debug)]
+pub struct QueryResultWithTokenScores {
+    #[pyo3(get)]
+    pub query_id: usize,
+    #[pyo3(get)]
+    pub passage_ids: Vec<i64>,
+    #[pyo3(get)]
+    pub scores: Vec<f32>,
+    pub token_scores_inner: Vec<Tensor>,
+}
+
+// SAFETY: tch::Tensor uses ATen's intrusive_ptr which is internally
+// atomic-reference-counted and safe to share across threads.
+unsafe impl Send for QueryResultWithTokenScores {}
+unsafe impl Sync for QueryResultWithTokenScores {}
+
+#[pymethods]
+impl QueryResultWithTokenScores {
+    /// Returns the per-document token similarity matrices.
+    ///
+    /// Each tensor has shape `[query_tokens, doc_tokens]` where values are
+    /// the cosine similarity between each query token and each document token.
+    #[getter]
+    fn token_scores(&self) -> Vec<PyTensor> {
+        self.token_scores_inner
+            .iter()
+            .map(|t| PyTensor(t.shallow_clone()))
+            .collect()
+    }
+}
+
 /// Search configuration parameters, exposed to Python.
 #[pyclass]
 #[derive(Clone, Debug)]
@@ -198,7 +241,7 @@ pub fn search_many(
                 .to_kind(Kind::Int64)
         });
 
-        let (passage_ids, scores) = search(
+        let (passage_ids, scores, _) = search(
             &query_embedding,
             &index.ivf_index_strided,
             &index.codec,
@@ -212,6 +255,7 @@ pub fn search_many(
             params.top_k,
             device,
             subset_tensor.as_ref(),
+            false,
         )
         .unwrap_or_default();
 
@@ -219,6 +263,74 @@ pub fn search_many(
             query_id: query_index as usize,
             passage_ids,
             scores,
+        }
+    };
+
+    let results = if show_progress {
+        let bar = ProgressBar::new(num_queries.try_into().unwrap());
+        (0..num_queries)
+            .progress_with(bar)
+            .map(search_closure)
+            .collect()
+    } else {
+        (0..num_queries).map(search_closure).collect()
+    };
+
+    Ok(results)
+}
+
+/// Processes a batch of queries and returns results with token-level similarity matrices.
+///
+/// Similar to `search_many` but each result includes per-document token similarity
+/// matrices of shape `[query_tokens, doc_tokens]`.
+pub fn search_many_with_token_scores(
+    queries: &Tensor,
+    index: &LoadedIndex,
+    params: &SearchParameters,
+    device: Device,
+    show_progress: bool,
+    subset: Option<Vec<Vec<i64>>>,
+) -> Result<Vec<QueryResultWithTokenScores>> {
+    let [num_queries, _, query_dim] = queries.size()[..] else {
+        bail!(
+            "Expected a 3D tensor for queries, but got shape {:?}",
+            queries.size()
+        );
+    };
+
+    let search_closure = |query_index| {
+        let query_embedding = queries.i(query_index).to(device);
+
+        let query_subset = subset.as_ref().and_then(|s| s.get(query_index as usize));
+        let subset_tensor = query_subset.map(|ids| {
+            Tensor::from_slice(ids)
+                .to_device(device)
+                .to_kind(Kind::Int64)
+        });
+
+        let (passage_ids, scores, token_matrices) = search(
+            &query_embedding,
+            &index.ivf_index_strided,
+            &index.codec,
+            query_dim,
+            &index.doc_codes_strided,
+            &index.doc_residuals_strided,
+            params.n_ivf_probe as i64,
+            params.batch_size as i64,
+            params.n_full_scores as i64,
+            index.nbits,
+            params.top_k,
+            device,
+            subset_tensor.as_ref(),
+            true,
+        )
+        .unwrap_or_default();
+
+        QueryResultWithTokenScores {
+            query_id: query_index as usize,
+            passage_ids,
+            scores,
+            token_scores_inner: token_matrices.unwrap_or_default(),
         }
     };
 
@@ -335,10 +447,12 @@ fn filter_passage_ids_with_subset(passage_ids: &Tensor, subset: &Tensor, device:
 /// * `top_k` - The final number of top results to return.
 /// * `device` - The `tch::Device` (e.g., `Device::Cuda(0)`) on which to perform computations.
 /// * `subset` - An optional tensor of document IDs to restrict the search to.
+/// * `return_token_scores` - If true, also returns per-document token similarity matrices.
 ///
 /// # Returns
-/// A `Result` containing a tuple of two vectors: the top `k` passage IDs (`Vec<i64>`) and their
-/// corresponding final scores (`Vec<f32>`).
+/// A `Result` containing a tuple of: the top `k` passage IDs (`Vec<i64>`), their
+/// corresponding final scores (`Vec<f32>`), and optionally a list of token similarity
+/// matrices (each of shape `[query_tokens, doc_tokens]`).
 pub fn search(
     query_embeddings: &Tensor,
     ivf_index_strided: &StridedTensor,
@@ -353,8 +467,9 @@ pub fn search(
     top_k: usize,
     device: Device,
     subset: Option<&Tensor>,
-) -> anyhow::Result<(Vec<i64>, Vec<f32>)> {
-    let (passage_ids, scores) = tch::no_grad(|| {
+    return_token_scores: bool,
+) -> anyhow::Result<(Vec<i64>, Vec<f32>, Option<Vec<Tensor>>)> {
+    let (passage_ids, scores, token_matrices) = tch::no_grad(|| {
         let query_embeddings_unsqueezed = query_embeddings.unsqueeze(0);
 
         // Compute query-centroid scores
@@ -417,7 +532,7 @@ pub fn search(
         }
 
         if unique_passage_ids.numel() == 0 {
-            return Ok((vec![], vec![]));
+            return Ok((vec![], vec![], None));
         }
 
         // Approximate scoring using coarse centroids
@@ -489,7 +604,7 @@ pub fn search(
         }
 
         if passage_ids_to_rerank.numel() == 0 {
-            return Ok((vec![], vec![]));
+            return Ok((vec![], vec![], None));
         }
 
         // Full decompression and exact scoring
@@ -521,24 +636,46 @@ pub fn search(
         let (padded_doc_embeddings, mask) =
             direct_pad_sequences(&decompressed_embeddings, &final_doc_lengths, 0.0, device)?;
 
-        let scores = padded_doc_embeddings.matmul(&query_embeddings_unsqueezed.transpose(-2, -1));
-        let scores = colbert_score_reduce(&scores, &mask);
+        let token_scores_3d =
+            padded_doc_embeddings.matmul(&query_embeddings_unsqueezed.transpose(-2, -1));
+        let reduced_scores = colbert_score_reduce(&token_scores_3d, &mask);
 
         // Final top-k sort
-        let (scores, sorted_indices) = scores.sort(0, true);
+        let (reduced_scores, sorted_indices) = reduced_scores.sort(0, true);
 
         let sorted_passage_ids = passage_ids_to_rerank.index_select(0, &sorted_indices);
 
         let sorted_passage_ids: Vec<i64> = sorted_passage_ids.try_into()?;
-        let scores: Vec<f32> = scores.try_into()?;
+        let reduced_scores: Vec<f32> = reduced_scores.try_into()?;
 
         let result_count = top_k.min(sorted_passage_ids.len());
 
+        let token_matrices = if return_token_scores {
+            let sorted_token_scores = token_scores_3d.index_select(0, &sorted_indices);
+            let sorted_doc_lengths: Vec<i64> =
+                final_doc_lengths.index_select(0, &sorted_indices).try_into()?;
+
+            let mut matrices = Vec::with_capacity(result_count);
+            for i in 0..result_count {
+                let doc_len = sorted_doc_lengths[i];
+                // [max_doc_len, query_len] → [doc_len, query_len] → [query_len, doc_len]
+                let mat = sorted_token_scores
+                    .i(i as i64)
+                    .narrow(0, 0, doc_len)
+                    .transpose(0, 1);
+                matrices.push(mat);
+            }
+            Some(matrices)
+        } else {
+            None
+        };
+
         Ok((
             sorted_passage_ids[..result_count].to_vec(),
-            scores[..result_count].to_vec(),
+            reduced_scores[..result_count].to_vec(),
+            token_matrices,
         ))
     })?;
 
-    Ok((passage_ids, scores))
+    Ok((passage_ids, scores, token_matrices))
 }
