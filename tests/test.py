@@ -103,6 +103,100 @@ class TestBasicCreateAndSearch:
         )
 
 
+class TestSearchTokenScores:
+    """Tests for search_token_scores returning per-token similarity matrices."""
+
+    def test_search_token_scores_basic(self, test_index_path):
+        """Test that search_token_scores returns correctly shaped token matrices."""
+        index = search.FastPlaid(index=test_index_path, device="cpu")
+
+        num_docs = 50
+        doc_token_counts = [30 + i for i in range(num_docs)]
+        documents_embeddings = [
+            torch.randn(n_tok, 128, device="cpu") for n_tok in doc_token_counts
+        ]
+        query_tokens = 20
+        queries_embeddings = torch.randn(3, query_tokens, 128, device="cpu")
+
+        index.create(documents_embeddings=documents_embeddings, kmeans_niters=4)
+        results = index.search_token_scores(
+            queries_embeddings=queries_embeddings, top_k=5
+        )
+
+        assert len(results) == 3, "Expected 3 sets of query results"
+        for query_results in results:
+            assert len(query_results) == 5, "Expected 5 results per query"
+            for doc_id, score, token_scores in query_results:
+                assert isinstance(doc_id, int)
+                assert isinstance(score, float)
+                assert isinstance(token_scores, torch.Tensor)
+                # Shape should be [query_tokens, doc_tokens_for_this_doc]
+                assert token_scores.shape[0] == query_tokens, (
+                    f"Expected {query_tokens} query tokens, got {token_scores.shape[0]}"
+                )
+                expected_doc_tokens = doc_token_counts[doc_id]
+                assert token_scores.shape[1] == expected_doc_tokens, (
+                    f"Expected {expected_doc_tokens} doc tokens for doc {doc_id}, "
+                    f"got {token_scores.shape[1]}"
+                )
+
+    def test_search_token_scores_consistency_with_search(self, test_index_path):
+        """Test that search_token_scores returns the same rankings as search."""
+        index = search.FastPlaid(index=test_index_path, device="cpu")
+
+        documents_embeddings = [
+            torch.randn(50, 128, device="cpu") for _ in range(30)
+        ]
+        queries_embeddings = torch.randn(2, 20, 128, device="cpu")
+
+        index.create(documents_embeddings=documents_embeddings, kmeans_niters=4)
+
+        search_results = index.search(
+            queries_embeddings=queries_embeddings, top_k=10
+        )
+        token_score_results = index.search_token_scores(
+            queries_embeddings=queries_embeddings, top_k=10
+        )
+
+        for q_idx in range(len(search_results)):
+            search_ids = [doc_id for doc_id, _ in search_results[q_idx]]
+            token_ids = [doc_id for doc_id, _, _ in token_score_results[q_idx]]
+            assert search_ids == token_ids, (
+                f"Query {q_idx}: search and search_token_scores returned different rankings"
+            )
+
+            search_scores = [score for _, score in search_results[q_idx]]
+            token_scores = [score for _, score, _ in token_score_results[q_idx]]
+            for s1, s2 in zip(search_scores, token_scores):
+                assert abs(s1 - s2) < 1e-3, (
+                    f"Score mismatch: search={s1}, token_scores={s2}"
+                )
+
+    def test_search_token_scores_maxsim_values(self, test_index_path):
+        """Test that manual MaxSim over token matrices matches returned scores."""
+        index = search.FastPlaid(index=test_index_path, device="cpu")
+
+        documents_embeddings = [
+            torch.randn(50, 128, device="cpu") for _ in range(30)
+        ]
+        queries_embeddings = torch.randn(3, 20, 128, device="cpu")
+
+        index.create(documents_embeddings=documents_embeddings, kmeans_niters=4)
+        results = index.search_token_scores(
+            queries_embeddings=queries_embeddings, top_k=10
+        )
+
+        for query_results in results:
+            for doc_id, score, token_scores in query_results:
+                # Manual MaxSim: for each query token, max similarity across
+                # doc tokens, then sum. token_scores is [query_tokens, doc_tokens].
+                manual_score = token_scores.max(dim=1).values.sum().item()
+                assert abs(manual_score - score) < 0.1, (
+                    f"Doc {doc_id}: manual MaxSim={manual_score:.4f} != "
+                    f"returned score={score:.4f}"
+                )
+
+
 class TestUpdate:
     """Tests for index update functionality."""
 
