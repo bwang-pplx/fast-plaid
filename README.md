@@ -224,6 +224,23 @@ Providing a `subset` filter can significantly speed up the search process, espec
 
 &nbsp;
 
+## 🔬 Per-Token Similarity Matrices
+
+Use `search_token_scores()` to get the full token-level similarity matrix for each result. Each result includes a tensor of shape `(query_tokens, doc_tokens)` or `(query_tokens, image_patches)` for vision models like ColPali. Accepts the same parameters as `search()`.
+
+```python
+results = fast_plaid.search_token_scores(
+    queries_embeddings=torch.randn(2, 50, embedding_dim),
+    top_k=10,
+)
+
+for doc_id, score, token_scores in results[0]:
+    print(f"Doc {doc_id}: score={score:.2f}, matrix shape={token_scores.shape}")
+    # token_scores.shape == (50, num_doc_tokens)
+```
+
+&nbsp;
+
 ## ⚖️ Settings Trade-offs
 
 ### Initialization
