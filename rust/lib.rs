@@ -24,7 +24,10 @@ use crate::index::create::create_index;
 use crate::index::delete::delete_from_index;
 use crate::index::update::update_index;
 use search::load::{construct_index, get_device, PyLoadedIndex};
-use search::search::{search_many, QueryResult, SearchParameters};
+use search::search::{
+    search_many, search_many_with_token_scores, QueryResult, QueryResultWithTokenScores,
+    SearchParameters,
+};
 use utils::embeddings::reconstruct_embeddings;
 use utils::errors::anyhow_to_pyerr;
 
@@ -215,6 +218,58 @@ fn pysearch(
     Ok(results)
 }
 
+/// Performs a multi-vector search and returns token-level similarity matrices.
+///
+/// Similar to `pysearch` but each result also includes per-document token
+/// similarity matrices of shape `[query_tokens, doc_tokens]`.
+///
+/// Args:
+///     index (PyLoadedIndex): A reference to the loaded index object.
+///     device (str): Device to perform the search on (e.g., "cpu", "cuda:0").
+///     queries_embeddings (torch.Tensor): A 3D tensor of query embeddings
+///         with shape (num_queries, num_query_tokens, embedding_dim).
+///     search_parameters (SearchParameters): A SearchParameters object
+///         containing `top_k`, `n_ivf_probe`, etc.
+///     show_progress (bool): Whether to display a progress bar during search.
+///     subset (list[list[int]] | None): An optional filter to restrict the
+///         search per query.
+///
+/// Returns:
+///     list[QueryResultWithTokenScores]: A list of results, each containing
+///         passage_ids, scores, and token_scores (list of tensors).
+///
+/// Raises:
+///     RuntimeError: If searching fails.
+#[pyfunction]
+fn pysearch_with_token_scores(
+    py: Python<'_>,
+    index: &PyLoadedIndex,
+    device: String,
+    queries_embeddings: PyTensor,
+    search_parameters: &SearchParameters,
+    show_progress: bool,
+    subset: Option<Vec<Vec<i64>>>,
+) -> PyResult<Vec<QueryResultWithTokenScores>> {
+    let device_tch = get_device(&device)?;
+    let params = search_parameters.clone();
+    let index_inner = &index.inner;
+
+    let results = py
+        .allow_threads(move || {
+            search_many_with_token_scores(
+                &queries_embeddings,
+                index_inner,
+                &params,
+                device_tch,
+                show_progress,
+                subset,
+            )
+        })
+        .map_err(anyhow_to_pyerr)?;
+
+    Ok(results)
+}
+
 /// Adds new documents to an existing FastPlaid index.
 ///
 /// This is the low-level Rust implementation called by `FastPlaid.update()`.
@@ -309,12 +364,14 @@ fn delete(
 fn python_module(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<SearchParameters>()?;
     m.add_class::<QueryResult>()?;
+    m.add_class::<QueryResultWithTokenScores>()?;
     m.add_class::<PyLoadedIndex>()?;
 
     m.add_function(wrap_pyfunction!(initialize_torch, m)?)?;
     m.add_function(wrap_pyfunction!(construct_index, m)?)?;
     m.add_function(wrap_pyfunction!(create, m)?)?;
     m.add_function(wrap_pyfunction!(pysearch, m)?)?;
+    m.add_function(wrap_pyfunction!(pysearch_with_token_scores, m)?)?;
     m.add_function(wrap_pyfunction!(update, m)?)?;
     m.add_function(wrap_pyfunction!(delete, m)?)?;
     m.add_function(wrap_pyfunction!(reconstruct_embeddings, m)?)?;
