@@ -44,10 +44,10 @@ FastPlaid is available in multiple versions to support different PyTorch version
 
 | FastPlaid Version | PyTorch Version | Installation Command                |
 | ----------------- | --------------- | ----------------------------------- |
-| 1.4.4.290         | 2.9.0           | `pip install fast-plaid==1.4.4.290` |
-| 1.4.4.280         | 2.8.0           | `pip install fast-plaid==1.4.4.280` |
-| 1.4.4.271         | 2.7.1           | `pip install fast-plaid==1.4.4.271` |
-| 1.4.4.270         | 2.7.0           | `pip install fast-plaid==1.4.4.270` |
+| 1.4.6.290         | 2.9.0           | `pip install fast-plaid==1.4.6.290` |
+| 1.4.6.280         | 2.8.0           | `pip install fast-plaid==1.4.6.280` |
+| 1.4.6.271         | 2.7.1           | `pip install fast-plaid==1.4.6.271` |
+| 1.4.6.270         | 2.7.0           | `pip install fast-plaid==1.4.6.270` |
 
 ### Adding FastPlaid as a Dependency
 
@@ -56,7 +56,7 @@ You can add FastPlaid to your project dependencies with version ranges to ensure
 **For requirements.txt:**
 
 ```
-fast-plaid>=1.4.4.270,<=1.4.4.290
+fast-plaid>=1.4.6.270,<=1.4.6.290
 ```
 
 **For pyproject.toml:**
@@ -64,7 +64,7 @@ fast-plaid>=1.4.4.270,<=1.4.4.290
 ```toml
 [project]
 dependencies = [
-    "fast-plaid>=1.4.4.270,<=1.4.4.290"
+    "fast-plaid>=1.4.6.270,<=1.4.6.290"
 ]
 ```
 
@@ -72,7 +72,7 @@ dependencies = [
 
 ```python
 install_requires=[
-    "fast-plaid>=1.4.4.270,<=1.4.4.290"
+    "fast-plaid>=1.4.6.270,<=1.4.6.290"
 ]
 ```
 
@@ -221,6 +221,23 @@ print(scores)
 ```
 
 Providing a `subset` filter can significantly speed up the search process, especially when the subset is much smaller than the total number of indexed documents. In order to increase the recall when applying drastic filtering, consider increasing the `n_ivf_probe` parameter in the `.search()` method (default: 8). It controls the number of clusters to search within the index for each query. Only clusters that contain documents from the provided subset are considered during the search.
+
+&nbsp;
+
+## 🔬 Per-Token Similarity Matrices
+
+Use `search_token_scores()` to get the full token-level similarity matrix for each result. Each result includes a tensor of shape `(query_tokens, doc_tokens)` or `(query_tokens, image_patches)` for vision models like ColPali. Accepts the same parameters as `search()`.
+
+```python
+results = fast_plaid.search_token_scores(
+    queries_embeddings=torch.randn(2, 50, embedding_dim),
+    top_k=10,
+)
+
+for doc_id, score, token_scores in results[0]:
+    print(f"Doc {doc_id}: score={score:.2f}, matrix shape={token_scores.shape}")
+    # token_scores.shape == (50, num_doc_tokens)
+```
 
 &nbsp;
 

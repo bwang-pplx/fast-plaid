@@ -740,13 +740,7 @@ class FastPlaid:
         queries_embeddings: torch.Tensor | list[torch.Tensor],
         subset: list[list[int]] | list[int] | None,
     ) -> tuple[dict[str, Any], torch.Tensor, list[list[int]] | None]:
-        """Shared setup for search methods: reload index, validate, normalize inputs.
-
-        Returns:
-        -------
-        A tuple of (search_indices, queries_tensor, normalized_subset).
-
-        """
+        """Shared setup for search methods: reload index, validate, normalize inputs."""
         self._check_and_reload_index(blocking=False)
 
         with self._index_swap_lock:
@@ -816,6 +810,22 @@ class FastPlaid:
         device_fn:
             The per-device search callable (search_on_device or
             search_on_device_with_token_scores).
+        search_indices:
+            Mapping of device name to loaded index object.
+        queries_embeddings:
+            A 3D tensor of query embeddings (num_queries, n_tokens, embedding_dim).
+        subset:
+            Optional per-query document ID filters.
+        batch_size:
+            The number of queries to process in each batch.
+        n_full_scores:
+            The number of full scores to compute per query.
+        top_k:
+            The number of top results to return for each query.
+        n_ivf_probe:
+            The number of IVF clusters to probe.
+        show_progress:
+            Whether to display a progress bar during search.
         n_processes:
             Number of jobs for CPU parallelism via joblib.
             Ignored on GPU. Defaults to 1.
