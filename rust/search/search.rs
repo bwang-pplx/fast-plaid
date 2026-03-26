@@ -183,18 +183,23 @@ pub struct SearchParameters {
     /// Number of IVF cells to probe during the initial search.
     #[pyo3(get, set)]
     pub n_ivf_probe: usize,
+    /// Aggregation strategy: "max" for MaxSim (default), "mean" for MeanSim.
+    #[pyo3(get, set)]
+    pub aggregation: String,
 }
 
 #[pymethods]
 impl SearchParameters {
     /// Creates a new `SearchParameters` instance from Python.
     #[new]
-    fn new(batch_size: usize, n_full_scores: usize, top_k: usize, n_ivf_probe: usize) -> Self {
+    #[pyo3(signature = (batch_size, n_full_scores, top_k, n_ivf_probe, aggregation="max".to_string()))]
+    fn new(batch_size: usize, n_full_scores: usize, top_k: usize, n_ivf_probe: usize, aggregation: String) -> Self {
         Self {
             batch_size,
             n_full_scores,
             top_k,
             n_ivf_probe,
+            aggregation,
         }
     }
 }
@@ -257,6 +262,7 @@ pub fn search_many(
             device,
             subset_tensor.as_ref(),
             false,
+            &params.aggregation,
         )
         .unwrap_or_default();
 
@@ -324,6 +330,7 @@ pub fn search_many_with_token_scores(
             device,
             subset_tensor.as_ref(),
             true,
+            &params.aggregation,
         )
         .unwrap_or_default();
 
@@ -369,6 +376,13 @@ pub fn search_many_with_token_scores(
 /// A 1D `Tensor` of shape `[batch_size]`, where each element is the final aggregated
 /// ColBERT score for a query-document pair.
 pub fn colbert_score_reduce(token_scores: &Tensor, attention_mask: &Tensor) -> Tensor {
+    colbert_score_reduce_with_agg(token_scores, attention_mask, "max")
+}
+
+/// Aggregates token-level similarity scores with configurable aggregation.
+///
+/// `aggregation` can be `"max"` (MaxSim) or `"mean"` (MeanSim).
+pub fn colbert_score_reduce_with_agg(token_scores: &Tensor, attention_mask: &Tensor, aggregation: &str) -> Tensor {
     let scores_shape = token_scores.size();
 
     // Expand the document attention mask to match the shape of the token scores.
@@ -377,14 +391,31 @@ pub fn colbert_score_reduce(token_scores: &Tensor, attention_mask: &Tensor) -> T
     // Invert the mask to identify padding positions.
     let padding_mask = expanded_mask.logical_not();
 
-    // Nullify scores at padded positions by filling them with a large negative number.
-    let masked_scores = token_scores.masked_fill(&padding_mask, -9999.0);
+    match aggregation {
+        "mean" => {
+            // MeanSim: zero out padded positions, compute mean over valid query tokens.
+            let masked_scores = token_scores.masked_fill(&padding_mask, 0.0);
 
-    // For each document token, find the maximum similarity score across all query tokens (MaxSim).
-    let (max_scores_per_token, _) = masked_scores.max_dim(1, false);
+            // Count valid query tokens per document token (along dim 1).
+            let valid_counts = expanded_mask
+                .to_kind(Kind::Float)
+                .sum_dim_intlist(1, false, Kind::Float)
+                .clamp_min(1.0);
 
-    // Sum the MaxSim scores for all tokens in each document to get the final score.
-    max_scores_per_token.sum_dim_intlist(-1, false, Kind::Float)
+            // Sum scores along query dim and divide by valid count.
+            let sum_scores = masked_scores.sum_dim_intlist(1, false, Kind::Float);
+            let mean_scores_per_token = &sum_scores / &valid_counts;
+
+            // Sum across document tokens.
+            mean_scores_per_token.sum_dim_intlist(-1, false, Kind::Float)
+        }
+        _ => {
+            // MaxSim (default): nullify padded positions with large negative, then max.
+            let masked_scores = token_scores.masked_fill(&padding_mask, -9999.0);
+            let (max_scores_per_token, _) = masked_scores.max_dim(1, false);
+            max_scores_per_token.sum_dim_intlist(-1, false, Kind::Float)
+        }
+    }
 }
 
 /// Helper function: Intersects two 1D tensors that are ALREADY sorted and unique.
@@ -469,6 +500,7 @@ pub fn search(
     device: Device,
     subset: Option<&Tensor>,
     return_token_scores: bool,
+    aggregation: &str,
 ) -> anyhow::Result<(Vec<i64>, Vec<f32>, Option<Vec<Tensor>>)> {
     let (passage_ids, scores, token_matrices) = tch::no_grad(|| {
         let query_embeddings_unsqueezed = query_embeddings.unsqueeze(0);
@@ -566,7 +598,7 @@ pub fn search(
             let (padded_approx_scores, mask) =
                 direct_pad_sequences(&batch_approx_scores, &batch_doc_lengths, 0.0, device)?;
 
-            let padded_approx_scores = colbert_score_reduce(&padded_approx_scores, &mask);
+            let padded_approx_scores = colbert_score_reduce_with_agg(&padded_approx_scores, &mask, aggregation);
 
             approx_score_chunks.push(padded_approx_scores);
         }
@@ -639,7 +671,7 @@ pub fn search(
 
         let token_scores_3d =
             padded_doc_embeddings.matmul(&query_embeddings_unsqueezed.transpose(-2, -1));
-        let reduced_scores = colbert_score_reduce(&token_scores_3d, &mask);
+        let reduced_scores = colbert_score_reduce_with_agg(&token_scores_3d, &mask, aggregation);
 
         // Final top-k sort
         let (reduced_scores, sorted_indices) = reduced_scores.sort(0, true);
