@@ -49,7 +49,7 @@ pub struct Metadata {
 /// (IVF lists, compressed codes, and residuals).
 pub struct LoadedIndex {
     pub codec: ResidualCodec,
-    pub ivf_index_strided: StridedTensor,
+    pub ivf_index_strided: Option<StridedTensor>,
     pub doc_codes_strided: StridedTensor,
     pub doc_residuals_strided: StridedTensor,
     pub nbits: i64,
@@ -112,8 +112,8 @@ fn ensure_tensor(t: PyTensor, device: Device, kind: Kind) -> Tensor {
 /// * `avg_residual` - The average residual vector (float16).
 /// * `bucket_cutoffs` - Quantization bucket boundaries (float16).
 /// * `bucket_weights` - Quantization bucket values (float16).
-/// * `ivf` - The Inverted File index structure (int64).
-/// * `ivf_lengths` - Lengths of the IVF lists (int32).
+/// * `ivf` - The Inverted File index structure (int64). None for compress-only indices.
+/// * `ivf_lengths` - Lengths of the IVF lists (int32). None for compress-only indices.
 /// * `doc_codes` - The compressed document codes (int64).
 /// * `doc_residuals` - The compressed document residuals (uint8).
 /// * `doc_lengths` - The true lengths of documents (int64).
@@ -128,8 +128,8 @@ pub fn construct_index(
     avg_residual: PyTensor,
     bucket_cutoffs: PyTensor,
     bucket_weights: PyTensor,
-    ivf: PyTensor,
-    ivf_lengths: PyTensor,
+    ivf: Option<PyTensor>,
+    ivf_lengths: Option<PyTensor>,
     doc_codes: PyTensor,
     doc_residuals: PyTensor,
     doc_lengths: PyTensor,
@@ -152,12 +152,15 @@ pub fn construct_index(
     )
     .map_err(anyhow_to_pyerr)?;
 
-    // Build IVF index
-    let ivf_index_strided = StridedTensor::new(
-        ensure_tensor(ivf, main_device, Kind::Int64),
-        ensure_tensor(ivf_lengths, main_device, Kind::Int),
-        main_device,
-    );
+    // Build IVF index (None for compress-only indices)
+    let ivf_index_strided = match (ivf, ivf_lengths) {
+        (Some(ivf_t), Some(ivf_len_t)) => Some(StridedTensor::new(
+            ensure_tensor(ivf_t, main_device, Kind::Int64),
+            ensure_tensor(ivf_len_t, main_device, Kind::Int),
+            main_device,
+        )),
+        _ => None,
+    };
 
     // Load document data (large tensors, may stay on CPU in low memory mode)
     let doc_lens_t = ensure_tensor(doc_lengths, storage_device, Kind::Int64);
