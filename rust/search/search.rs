@@ -224,6 +224,13 @@ pub fn search_many(
     show_progress: bool,
     subset: Option<Vec<Vec<i64>>>,
 ) -> Result<Vec<QueryResult>> {
+    let ivf_index = index.ivf_index_strided.as_ref().ok_or_else(|| {
+        anyhow!(
+            "This index was built with compress_only=True and does not support search. \
+             Rebuild with compress_only=False to enable search."
+        )
+    })?;
+
     let [num_queries, _, query_dim] = queries.size()[..] else {
         bail!(
             "Expected a 3D tensor for queries, but got shape {:?}",
@@ -244,7 +251,7 @@ pub fn search_many(
 
         let (passage_ids, scores, _) = search(
             &query_embedding,
-            &index.ivf_index_strided,
+            ivf_index,
             &index.codec,
             query_dim,
             &index.doc_codes_strided,
@@ -292,6 +299,13 @@ pub fn search_many_with_token_scores(
     show_progress: bool,
     subset: Option<Vec<Vec<i64>>>,
 ) -> Result<Vec<QueryResultWithTokenScores>> {
+    let ivf_index = index.ivf_index_strided.as_ref().ok_or_else(|| {
+        anyhow!(
+            "This index was built with compress_only=True and does not support search. \
+             Rebuild with compress_only=False to enable search."
+        )
+    })?;
+
     let [num_queries, _, query_dim] = queries.size()[..] else {
         bail!(
             "Expected a 3D tensor for queries, but got shape {:?}",
@@ -311,7 +325,7 @@ pub fn search_many_with_token_scores(
 
         let (passage_ids, scores, token_matrices) = search(
             &query_embedding,
-            &index.ivf_index_strided,
+            ivf_index,
             &index.codec,
             query_dim,
             &index.doc_codes_strided,

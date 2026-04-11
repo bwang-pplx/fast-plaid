@@ -264,19 +264,26 @@ def _load_index_tensors_cpu(index_path: str) -> dict[str, Any] | None:
             dtype=torch.float16,
             device=device,
         ),
-        "ivf": _load_small_tensor(
+    }
+
+    ivf_path = os.path.join(index_path, "ivf.npy")
+    ivf_lengths_path = os.path.join(index_path, "ivf_lengths.npy")
+    if os.path.exists(ivf_path) and os.path.exists(ivf_lengths_path):
+        data["ivf"] = _load_small_tensor(
             index_path=index_path,
             name="ivf.npy",
             dtype=torch.int64,
             device=device,
-        ),
-        "ivf_lengths": _load_small_tensor(
+        )
+        data["ivf_lengths"] = _load_small_tensor(
             index_path=index_path,
             name="ivf_lengths.npy",
             dtype=torch.int32,
             device=device,
-        ),
-    }
+        )
+    else:
+        data["ivf"] = None
+        data["ivf_lengths"] = None
 
     all_doc_lens = []
     for i in range(num_chunks):
@@ -330,9 +337,11 @@ def _construct_index_from_tensors(
         If True, keeps large document tensors on CPU to save VRAM.
 
     """
-    gpu_data = {}
+    gpu_data: dict[str, Any] = {}
     for key, val in data.items():
-        if isinstance(val, torch.Tensor):
+        if val is None:
+            gpu_data[key] = None
+        elif isinstance(val, torch.Tensor):
             if low_memory and key in ["doc_codes", "doc_residuals", "doc_lengths"]:
                 gpu_data[key] = val
             else:

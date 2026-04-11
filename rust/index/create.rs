@@ -212,6 +212,7 @@ pub fn create_index(
     centroids: Tensor,
     batch_size: i64,
     seed: Option<u64>,
+    compress_only: bool,
 ) -> Result<()> {
     let n_docs = documents_embeddings.len();
     let n_chunks = (n_docs as f64 / (batch_size as f64).min(1.0 + n_docs as f64)).ceil() as usize;
@@ -521,38 +522,41 @@ pub fn create_index(
         }
     }
 
-    // Build global IVF
     let total_num_embeddings = current_emb_offset;
-    let all_codes = Tensor::zeros(&[total_num_embeddings as i64], (Kind::Int64, device));
 
-    for chunk_index in 0..n_chunks {
-        let chk_offset_global = chk_emb_offsets[chunk_index];
-        let codes_fpath = Path::new(index_path).join(format!("{}.codes.npy", chunk_index));
-        let codes_from_file = Tensor::read_npy(&codes_fpath)?.to_device(device);
-        let count = codes_from_file.size()[0];
-        all_codes
-            .narrow(0, chk_offset_global as i64, count)
-            .copy_(&codes_from_file);
+    // Build global IVF (skipped in compress_only mode)
+    if !compress_only {
+        let all_codes = Tensor::zeros(&[total_num_embeddings as i64], (Kind::Int64, device));
+
+        for chunk_index in 0..n_chunks {
+            let chk_offset_global = chk_emb_offsets[chunk_index];
+            let codes_fpath = Path::new(index_path).join(format!("{}.codes.npy", chunk_index));
+            let codes_from_file = Tensor::read_npy(&codes_fpath)?.to_device(device);
+            let count = codes_from_file.size()[0];
+            all_codes
+                .narrow(0, chk_offset_global as i64, count)
+                .copy_(&codes_from_file);
+        }
+
+        let (sorted_codes, sorted_indices) = all_codes.sort(0, false);
+        let code_counts = sorted_codes.bincount::<Tensor>(None, est_total_embeddings);
+
+        let (opt_ivf, opt_inverted_file_lengths) =
+            optimize_ivf(&sorted_indices, &code_counts, index_path, device)
+                .context("Failed to optimize IVF")?;
+
+        let opt_ivf_fpath = Path::new(index_path).join("ivf.npy");
+        opt_ivf
+            .to_device(Device::Cpu)
+            .to_kind(Kind::Int64)
+            .write_npy(&opt_ivf_fpath)?;
+
+        let opt_lengths_fpath = Path::new(index_path).join("ivf_lengths.npy");
+        opt_inverted_file_lengths
+            .to_device(Device::Cpu)
+            .to_kind(Kind::Int)
+            .write_npy(&opt_lengths_fpath)?;
     }
-
-    let (sorted_codes, sorted_indices) = all_codes.sort(0, false);
-    let code_counts = sorted_codes.bincount::<Tensor>(None, est_total_embeddings);
-
-    let (opt_ivf, opt_inverted_file_lengths) =
-        optimize_ivf(&sorted_indices, &code_counts, index_path, device)
-            .context("Failed to optimize IVF")?;
-
-    let opt_ivf_fpath = Path::new(index_path).join("ivf.npy");
-    opt_ivf
-        .to_device(Device::Cpu)
-        .to_kind(Kind::Int64)
-        .write_npy(&opt_ivf_fpath)?;
-
-    let opt_lengths_fpath = Path::new(index_path).join("ivf_lengths.npy");
-    opt_inverted_file_lengths
-        .to_device(Device::Cpu)
-        .to_kind(Kind::Int)
-        .write_npy(&opt_lengths_fpath)?;
 
     // Write global metadata
     let final_meta_fpath = Path::new(index_path).join("metadata.json");
@@ -569,6 +573,7 @@ pub fn create_index(
         "num_embeddings": total_num_embeddings,
         "avg_doclen": final_avg_doclen,
         "num_documents": num_documents,
+        "compress_only": compress_only,
     });
 
     serde_json::to_writer_pretty(

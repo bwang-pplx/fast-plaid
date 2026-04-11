@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use indicatif::{ProgressBar, ProgressIterator};
 use pyo3_tch::PyTensor;
 use serde_json;
@@ -59,6 +59,10 @@ pub fn update_index(
         .context("Missing 'num_partitions' in metadata")?;
 
     let old_total_embeddings_count = main_meta["num_embeddings"].as_i64().unwrap_or(0);
+    let compress_only = main_meta
+        .get("compress_only")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
 
     let embedding_dim = index.codec.centroids.size()[1];
     let num_centroids = index.codec.centroids.size()[0];
@@ -310,127 +314,135 @@ pub fn update_index(
         }
     }
 
-    // Generate new partial IVF
-    let new_codes_flat = Tensor::cat(&new_codes_accumulated, 0).to_device(Device::Cpu);
-    drop(new_codes_accumulated);
-    let new_codes_vec: Vec<i64> = Vec::<i64>::try_from(&new_codes_flat)?;
+    // Generate new partial IVF and merge with old (skipped in compress_only mode)
+    if !compress_only {
+        let new_codes_flat = Tensor::cat(&new_codes_accumulated, 0).to_device(Device::Cpu);
+        let new_codes_vec: Vec<i64> = Vec::<i64>::try_from(&new_codes_flat)?;
 
-    let mut partition_pids_map: HashMap<i64, Vec<i64>> = HashMap::new();
-    let mut pid_counter = old_num_documents;
-    let mut code_idx = 0;
-    for &doc_len in &new_doclens_accumulated {
-        for _ in 0..doc_len {
-            let code = new_codes_vec[code_idx];
-            partition_pids_map
-                .entry(code)
-                .or_insert_with(Vec::new)
-                .push(pid_counter);
-            code_idx += 1;
+        let mut partition_pids_map: HashMap<i64, Vec<i64>> = HashMap::new();
+        let mut pid_counter = old_num_documents;
+        let mut code_idx = 0;
+        for &doc_len in &new_doclens_accumulated {
+            for _ in 0..doc_len {
+                let code = new_codes_vec[code_idx];
+                partition_pids_map
+                    .entry(code)
+                    .or_insert_with(Vec::new)
+                    .push(pid_counter);
+                code_idx += 1;
+            }
+            pid_counter += 1;
         }
-        pid_counter += 1;
-    }
 
-    let mut new_partition_data: HashMap<usize, Tensor> = HashMap::new();
-    for (code, mut pids) in partition_pids_map.into_iter() {
-        if code >= 0 && code < est_num_embeddings {
-            pids.sort_unstable();
-            pids.dedup();
-            let unique_pids = Tensor::from_slice(&pids).to_device(Device::Cpu);
-            new_partition_data.insert(code as usize, unique_pids);
+        let mut new_partition_data: HashMap<usize, Tensor> = HashMap::new();
+        for (code, mut pids) in partition_pids_map.into_iter() {
+            if code >= 0 && code < est_num_embeddings {
+                pids.sort_unstable();
+                pids.dedup();
+                let unique_pids = Tensor::from_slice(&pids).to_device(Device::Cpu);
+                new_partition_data.insert(code as usize, unique_pids);
+            }
         }
-    }
 
-    // Merge with old IVF
-    let old_ivf_flat = &index.ivf_index_strided.underlying_data;
-    let old_ivf_lengths = &index.ivf_index_strided.element_lengths;
-    let old_ivf_lengths_cpu = old_ivf_lengths.to_device(Device::Cpu);
-    let old_lengths_vec: Vec<i64> = Vec::<i64>::try_from(&old_ivf_lengths_cpu)?;
-    let num_partitions = est_num_embeddings as usize;
+        // Merge with old IVF
+        let ivf_strided = index.ivf_index_strided.as_ref().ok_or_else(|| {
+            anyhow!(
+                "Index metadata indicates compress_only=false but IVF data is missing. \
+                 The index may be corrupt."
+            )
+        })?;
+        let old_ivf_flat = &ivf_strided.underlying_data;
+        let old_ivf_lengths = &ivf_strided.element_lengths;
+        let old_ivf_lengths_cpu = old_ivf_lengths.to_device(Device::Cpu);
+        let old_lengths_vec: Vec<i64> = Vec::<i64>::try_from(&old_ivf_lengths_cpu)?;
+        let num_partitions = est_num_embeddings as usize;
 
-    if new_partition_data.is_empty() {
-        return Ok(());
-    }
+        if new_partition_data.is_empty() {
+            return Ok(());
+        }
 
-    let mut old_ivf_offsets = Vec::with_capacity(old_lengths_vec.len());
-    let mut curr = 0;
-    for &l in &old_lengths_vec {
-        old_ivf_offsets.push(curr);
-        curr += l;
-    }
+        let mut old_ivf_offsets = Vec::with_capacity(old_lengths_vec.len());
+        let mut curr = 0;
+        for &l in &old_lengths_vec {
+            old_ivf_offsets.push(curr);
+            curr += l;
+        }
 
-    let mut final_ivf_parts: Vec<Tensor> = Vec::new();
-    let mut final_lengths_vec: Vec<i64> = Vec::with_capacity(num_partitions);
+        let mut final_ivf_parts: Vec<Tensor> = Vec::new();
+        let mut final_lengths_vec: Vec<i64> = Vec::with_capacity(num_partitions);
 
-    let mut i = 0;
-    while i < num_partitions {
-        if let Some(new_pids) = new_partition_data.get(&i) {
-            let old_len = if i < old_lengths_vec.len() {
-                old_lengths_vec[i]
-            } else {
-                0
-            };
-            let new_len = new_pids.size()[0];
-            if old_len > 0 {
-                let start = old_ivf_offsets[i];
-                final_ivf_parts.push(
-                    old_ivf_flat
-                        .narrow(0, start, old_len)
-                        .to_device(Device::Cpu),
-                );
-            }
-            final_ivf_parts.push(new_pids.shallow_clone());
-            final_lengths_vec.push(old_len + new_len);
-            i += 1;
-        } else {
-            let range_start = i;
-            while i < num_partitions && !new_partition_data.contains_key(&i) {
-                i += 1;
-            }
-            let range_end = i;
-
-            let flat_start = if range_start < old_ivf_offsets.len() {
-                old_ivf_offsets[range_start]
-            } else {
-                0
-            };
-            let flat_end = if range_end < old_ivf_offsets.len() {
-                old_ivf_offsets[range_end]
-            } else if range_end > 0 && range_end - 1 < old_lengths_vec.len() {
-                old_ivf_offsets[range_end - 1] + old_lengths_vec[range_end - 1]
-            } else {
-                flat_start
-            };
-
-            let flat_length = flat_end - flat_start;
-            if flat_length > 0 {
-                final_ivf_parts.push(
-                    old_ivf_flat
-                        .narrow(0, flat_start, flat_length)
-                        .to_device(Device::Cpu),
-                );
-            }
-
-            for j in range_start..range_end {
-                let old_len = if j < old_lengths_vec.len() {
-                    old_lengths_vec[j]
+        let mut i = 0;
+        while i < num_partitions {
+            if let Some(new_pids) = new_partition_data.get(&i) {
+                let old_len = if i < old_lengths_vec.len() {
+                    old_lengths_vec[i]
                 } else {
                     0
                 };
-                final_lengths_vec.push(old_len);
+                let new_len = new_pids.size()[0];
+                if old_len > 0 {
+                    let start = old_ivf_offsets[i];
+                    final_ivf_parts.push(
+                        old_ivf_flat
+                            .narrow(0, start, old_len)
+                            .to_device(Device::Cpu),
+                    );
+                }
+                final_ivf_parts.push(new_pids.shallow_clone());
+                final_lengths_vec.push(old_len + new_len);
+                i += 1;
+            } else {
+                let range_start = i;
+                while i < num_partitions && !new_partition_data.contains_key(&i) {
+                    i += 1;
+                }
+                let range_end = i;
+
+                let flat_start = if range_start < old_ivf_offsets.len() {
+                    old_ivf_offsets[range_start]
+                } else {
+                    0
+                };
+                let flat_end = if range_end < old_ivf_offsets.len() {
+                    old_ivf_offsets[range_end]
+                } else if range_end > 0 && range_end - 1 < old_lengths_vec.len() {
+                    old_ivf_offsets[range_end - 1] + old_lengths_vec[range_end - 1]
+                } else {
+                    flat_start
+                };
+
+                let flat_length = flat_end - flat_start;
+                if flat_length > 0 {
+                    final_ivf_parts.push(
+                        old_ivf_flat
+                            .narrow(0, flat_start, flat_length)
+                            .to_device(Device::Cpu),
+                    );
+                }
+
+                for j in range_start..range_end {
+                    let old_len = if j < old_lengths_vec.len() {
+                        old_lengths_vec[j]
+                    } else {
+                        0
+                    };
+                    final_lengths_vec.push(old_len);
+                }
             }
         }
+
+        let final_ivf_tensor = Tensor::cat(&final_ivf_parts, 0);
+        let final_lengths_tensor = Tensor::from_slice(&final_lengths_vec)
+            .to_device(Device::Cpu)
+            .to_kind(Kind::Int);
+
+        // Write updated global files
+        final_ivf_tensor
+            .to_kind(Kind::Int64)
+            .write_npy(&idx_path_obj.join("ivf.npy"))?;
+        final_lengths_tensor.write_npy(&idx_path_obj.join("ivf_lengths.npy"))?;
     }
-
-    let final_ivf_tensor = Tensor::cat(&final_ivf_parts, 0);
-    let final_lengths_tensor = Tensor::from_slice(&final_lengths_vec)
-        .to_device(Device::Cpu)
-        .to_kind(Kind::Int);
-
-    // Write updated global files
-    final_ivf_tensor
-        .to_kind(Kind::Int64)
-        .write_npy(&idx_path_obj.join("ivf.npy"))?;
-    final_lengths_tensor.write_npy(&idx_path_obj.join("ivf_lengths.npy"))?;
+    drop(new_codes_accumulated);
 
     // Update global metadata
     let new_tokens_count: i64 = new_doclens_accumulated.iter().sum();
@@ -452,6 +464,7 @@ pub fn update_index(
         "num_embeddings": num_embeddings,
         "num_documents": total_num_documents,
         "avg_doclen": final_avg_doclen,
+        "compress_only": compress_only,
     });
     let final_meta_file = fs::File::create(&main_meta_path)?;
     serde_json::to_writer_pretty(BufWriter::new(final_meta_file), &final_meta_json)?;
