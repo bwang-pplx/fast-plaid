@@ -58,7 +58,7 @@ You can add FastPlaid to your project dependencies with version ranges to ensure
 **For requirements.txt:**
 
 ```
-fast-plaid>=1.4.6.270,<=1.4.6.290
+fast-plaid>=1.4.6.270,<=1.4.6.2110
 ```
 
 **For pyproject.toml:**
@@ -74,7 +74,7 @@ dependencies = [
 
 ```python
 install_requires=[
-    "fast-plaid>=1.4.6.270,<=1.4.6.290"
+    "fast-plaid>=1.4.6.270,<=1.4.6.2110"
 ]
 ```
 
