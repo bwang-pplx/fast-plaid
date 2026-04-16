@@ -123,6 +123,8 @@ fn initialize_torch(_py: Python<'_>, torch_path: String) -> PyResult<()> {
 ///         pre-computed by K-means on the Python side.
 ///     batch_size (int): Batch size for processing embeddings during creation.
 ///     seed (int | None): Optional seed for reproducible index creation.
+///     compress_only (bool): If True, skip IVF construction (index cannot be
+///         searched, but ``get_embeddings()`` still works).
 ///
 /// Raises:
 ///     RuntimeError: If index creation fails or `libtorch` fails to load.
@@ -138,6 +140,7 @@ fn create(
     centroids: PyTensor,
     batch_size: i64,
     seed: Option<u64>,
+    compress_only: bool,
 ) -> PyResult<()> {
     call_torch(torch_path)
         .map_err(|e| PyRuntimeError::new_err(format!("Failed to load Torch library: {}", e)))?;
@@ -154,6 +157,7 @@ fn create(
         centroids,
         batch_size,
         seed,
+        compress_only,
     )
     .map_err(|e| PyRuntimeError::new_err(format!("Failed to create index: {}", e)));
 

@@ -526,6 +526,7 @@ class FastPlaid:
         use_triton_kmeans: bool | None = None,
         metadata: list[dict[str, Any]] | None = None,
         start_from_scratch: int = 1000,
+        compress_only: bool = False,
     ) -> "FastPlaid":
         """Create and saves the FastPlaid index.
 
@@ -551,6 +552,9 @@ class FastPlaid:
             A list of metadata dictionaries corresponding to the documents.
         start_from_scratch:
             Threshold of documents below which the index is built from scratch.
+        compress_only:
+            If True, skip IVF construction. The index can be used with
+            ``get_embeddings()`` but not ``search()``.
 
         """
         # Exclusive Lock for Modification
@@ -608,6 +612,7 @@ class FastPlaid:
                 centroids=centroids,
                 batch_size=batch_size,
                 seed=seed,
+                compress_only=compress_only,
             )
 
             # Explicit cleanup of create objects
@@ -868,9 +873,7 @@ class FastPlaid:
                     show_progress=(show_progress and i == 0),
                     subset=sub_chunk,
                 )
-                for i, (chunk, sub_chunk) in enumerate(
-                    zip(query_chunks, subset_chunks)
-                )
+                for i, (chunk, sub_chunk) in enumerate(zip(query_chunks, subset_chunks))
             )
             return [item for sublist in results for item in sublist]
 

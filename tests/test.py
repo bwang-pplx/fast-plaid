@@ -707,6 +707,112 @@ class TestGetEmbeddings:
         )
 
 
+class TestCompressOnly:
+    """Tests for compress_only mode (no IVF construction)."""
+
+    def test_compress_only_get_embeddings(self, test_index_path):
+        """Test that get_embeddings works on a compress_only index."""
+        index = search.FastPlaid(index=test_index_path, device="cpu")
+
+        documents_embeddings = [torch.randn(100, 128, device="cpu") for _ in range(20)]
+        index.create(
+            documents_embeddings=documents_embeddings,
+            kmeans_niters=4,
+            compress_only=True,
+        )
+
+        # get_embeddings should work without IVF
+        reconstructed = index.get_embeddings(subset=[0, 5, 10])
+
+        assert len(reconstructed) == 3, (
+            f"Expected 3 reconstructed embeddings, got {len(reconstructed)}"
+        )
+        for emb in reconstructed:
+            assert emb.dim() == 2
+            assert emb.shape[1] == 128
+
+    def test_compress_only_no_ivf_files(self, test_index_path):
+        """Test that compress_only skips writing ivf.npy and ivf_lengths.npy."""
+        index = search.FastPlaid(index=test_index_path, device="cpu")
+
+        documents_embeddings = [torch.randn(100, 128, device="cpu") for _ in range(20)]
+        index.create(
+            documents_embeddings=documents_embeddings,
+            kmeans_niters=4,
+            compress_only=True,
+        )
+
+        assert not os.path.exists(os.path.join(test_index_path, "ivf.npy"))
+        assert not os.path.exists(os.path.join(test_index_path, "ivf_lengths.npy"))
+
+    def test_compress_only_search_raises(self, test_index_path):
+        """Test that search raises an error on a compress_only index."""
+        index = search.FastPlaid(index=test_index_path, device="cpu")
+
+        documents_embeddings = [torch.randn(100, 128, device="cpu") for _ in range(20)]
+        index.create(
+            documents_embeddings=documents_embeddings,
+            kmeans_niters=4,
+            compress_only=True,
+        )
+
+        queries_embeddings = torch.randn(2, 30, 128, device="cpu")
+        with pytest.raises((RuntimeError, ValueError), match="compress_only"):
+            index.search(queries_embeddings=queries_embeddings, top_k=5)
+
+    def test_compress_only_metadata_flag(self, test_index_path):
+        """Test that metadata.json contains compress_only field."""
+        import json
+
+        index = search.FastPlaid(index=test_index_path, device="cpu")
+
+        documents_embeddings = [torch.randn(100, 128, device="cpu") for _ in range(20)]
+        index.create(
+            documents_embeddings=documents_embeddings,
+            kmeans_niters=4,
+            compress_only=True,
+        )
+
+        with open(os.path.join(test_index_path, "metadata.json")) as f:
+            metadata = json.load(f)
+
+        assert metadata["compress_only"] is True
+
+    def test_compress_only_update_and_get_embeddings(self, test_index_path):
+        """Test that update works on a compress_only index and get_embeddings still works."""
+        import json
+
+        index = search.FastPlaid(index=test_index_path, device="cpu")
+
+        documents_embeddings = [torch.randn(100, 128, device="cpu") for _ in range(20)]
+        index.create(
+            documents_embeddings=documents_embeddings,
+            kmeans_niters=4,
+            compress_only=True,
+        )
+
+        # Update with new documents
+        new_embeddings = [torch.randn(80, 128, device="cpu") for _ in range(5)]
+        index.update(documents_embeddings=new_embeddings)
+
+        # IVF files should still not exist
+        assert not os.path.exists(os.path.join(test_index_path, "ivf.npy"))
+        assert not os.path.exists(os.path.join(test_index_path, "ivf_lengths.npy"))
+
+        # compress_only flag should be preserved in metadata
+        with open(os.path.join(test_index_path, "metadata.json")) as f:
+            metadata = json.load(f)
+        assert metadata["compress_only"] is True
+        assert metadata["num_documents"] == 25
+
+        # get_embeddings should work for both old and new documents
+        reconstructed = index.get_embeddings(subset=[0, 10, 22])
+        assert len(reconstructed) == 3
+        for emb in reconstructed:
+            assert emb.dim() == 2
+            assert emb.shape[1] == 128
+
+
 class TestQueryFormats:
     """Tests for different query embedding formats."""
 

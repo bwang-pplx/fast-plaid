@@ -294,6 +294,7 @@ def process_update(
     with open(os.path.join(index_path, "metadata.json")) as f:
         meta = json.load(f)
         num_documents_in_index = meta.get("num_documents", start_from_scratch + 1)
+        compress_only = meta.get("compress_only", False)
 
     num_docs = len(documents_embeddings)
 
@@ -332,6 +333,7 @@ def process_update(
             use_triton_kmeans=use_triton_kmeans,
             metadata=None,
             start_from_scratch=start_from_scratch,
+            compress_only=compress_only,
         )
 
         if len(documents_embeddings) > start_from_scratch and os.path.exists(
